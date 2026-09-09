@@ -4,7 +4,6 @@ import asyncio
 import queue
 import re
 import threading
-import wave
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,33 +11,22 @@ from typing import Any, cast
 
 import numpy as np
 import pyaudiowpatch as pyaudio
-
+import soundfile as sf
+from mutagen.flac import FLAC, Picture
 from winsdk.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as SessionManager,
 )
 from winsdk.windows.storage.streams import DataReader
-
-from mutagen.id3 import (
-    APIC,
-    TALB,
-    TCON,
-    TIT2,
-    TPE1,
-    TPE2,
-    TRCK,
-    ID3,
-)
-from mutagen.wave import WAVE
 
 
 # Configuration Constants
 SAMPLE_RATE = 48_000
 CHANNELS = 2
 OUTPUT_DIRECTORY = Path("output")
-METADATA_POLL_SECONDS = 0.5
+METADATA_POLL_SECONDS = 0.1
 
 # Time in seconds before the metadata API update that the new track actually started
-SONG_SPLIT_OFFSET_SECONDS = 1.5
+SONG_SPLIT_OFFSET_SECONDS = 0.06
 
 stop_event = threading.Event()
 
@@ -265,49 +253,37 @@ def save_song(
     album_art = metadata.get("album_art")
 
     base_name = sanitize_filename(f"{artist} - {title}")
-    wav_path = unique_path(OUTPUT_DIRECTORY / f"{base_name}.wav")
+    flac_path = unique_path(OUTPUT_DIRECTORY / f"{base_name}.flac")
 
-    with wave.open(str(wav_path), "wb") as wav_file:
-        wav_file.setnchannels(CHANNELS)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(SAMPLE_RATE)
-        wav_file.writeframes(audio.tobytes())
+    # 1. Write PCM audio to FLAC container
+    sf.write(str(flac_path), audio, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
 
-    wav_file = WAVE(str(wav_path))
+    # 2. Attach Vorbis Comments and Album Art
+    flac = FLAC(str(flac_path))
 
-    if wav_file.tags is None:
-        wav_file.add_tags()
-
-    tags = wav_file.tags
-    assert tags is not None
-
-    tags.add(TIT2(encoding=3, text=title))
-    tags.add(TPE1(encoding=3, text=artist))
-
+    flac["title"] = title
+    flac["artist"] = artist
     if album:
-        tags.add(TALB(encoding=3, text=album))
+        flac["album"] = album
     if album_artist:
-        tags.add(TPE2(encoding=3, text=album_artist))
+        flac["albumartist"] = album_artist
     if genre:
-        tags.add(TCON(encoding=3, text=genre))
+        flac["genre"] = genre
     if track_number:
-        tags.add(TRCK(encoding=3, text=str(track_number)))
+        flac["tracknumber"] = str(track_number)
 
     if album_art:
-        mime_type = detect_image_mime_type(album_art)
-        tags.add(
-            APIC(
-                encoding=3,
-                mime=mime_type,
-                type=3,
-                desc="Cover",
-                data=album_art,
-            )
-        )
+        picture = Picture()
+        picture.type = 3  # Front Cover
+        picture.mime = detect_image_mime_type(album_art)
+        picture.desc = "Cover"
+        picture.data = album_art
+        flac.clear_pictures()
+        flac.add_picture(picture)
 
-    wav_file.save()
+    flac.save()
 
-    print(f"Saved: {wav_path}")
+    print(f"Saved: {flac_path}")
 
 
 def saving_thread():
@@ -328,8 +304,6 @@ def saving_thread():
             new_metadata = metadata_queue.get()
 
             if current_metadata is not None and current_chunks:
-                # Split boundary: Keep samples prior to (now - SONG_SPLIT_OFFSET_SECONDS) for the old song,
-                # and shift the recent samples into the new song's buffer.
                 split_threshold = now - SONG_SPLIT_OFFSET_SECONDS
                 old_song_chunks: list[np.ndarray] = [c for t, c in current_chunks if t < split_threshold]
                 next_song_chunks: list[tuple[float, np.ndarray]] = [
